@@ -118,18 +118,28 @@ stateDiagram-v2
     Idle --> Playing: 最初のタップ
     Playing --> Playing: タップ (1-2回目)
     Playing --> Destroying: タップ (3回目)
-    Destroying --> DropCheck: 破壊アニメーション完了
-    DropCheck --> DiamondDrop: 10%確率
-    DropCheck --> Playing: 90%確率 (新しい鉱石)
+    Destroying --> Playing: 破壊完了 + ドロップなし (90%)
+    Destroying --> DiamondDrop: 破壊完了 + ドロップ (10%)
     DiamondDrop --> Result: ドロップ演出完了
     Result --> Idle: リトライボタンタップ
 ```
 
 **Key Decisions**:
-- 状態遷移はGameState enumで明示的に管理
-- Destroyingは一時的な状態（アニメーション再生中）
-- DropCheckは内部状態（UI非表示）
-- タイマーはPlaying状態でのみ動作
+- 状態遷移はGameState enumで明示的に管理（5状態のみ）
+- Destroyingは破壊アニメーション再生中の一時状態
+- **DropCheckはGameStateに存在しない**（Destroying状態内でドロップ判定を実行し、即座に次状態へ遷移）
+- DiamondDropはダイヤモンドドロップ演出専用の状態（破壊アニメーションとは別の演出）
+- タイマーはPlaying/Destroying状態でのみ動作
+
+**Destroying vs DiamondDrop の明確な区別**:
+- **Destroying**: 鉱石が砕ける破壊アニメーション（0.4秒、パーティクル飛散）
+- **DiamondDrop**: ダイヤモンド出現の特別演出（1.5秒、輝きエフェクト、タイマー停止後）
+- 両者は連続して発生するが、別々の演出として独立
+
+**状態遷移のタイミング仕様**:
+1. Playing → Destroying: 3回目のタップ即座
+2. Destroying → Playing/DiamondDrop: 破壊アニメーション完了時（Task.sleep(0.4)後、アニメーション完了イベントは使用しない）
+3. DiamondDrop → Result: ドロップ演出完了時（Task.sleep(1.5)後）
 
 ### 鉱石タップ処理フロー
 
@@ -156,45 +166,196 @@ sequenceDiagram
 
     alt tapCount == 3
         ViewModel->>ViewModel: setState(.destroying)
-        Note over ViewModel: 破壊アニメーション開始
-        ViewModel->>ViewModel: Task.sleep(0.4秒)
+        ViewModel->>ViewModel: isDestroyAnimationActive = true
+        Note over ViewModel: 破壊アニメーション開始 (withAnimation)
+        ViewModel->>ViewModel: Task.sleep(DESTROY_ANIMATION_DURATION)
+        ViewModel->>ViewModel: isDestroyAnimationActive = false
         ViewModel->>ViewModel: dropCheck()
 
         alt ダイヤモンドドロップ
             ViewModel->>Timer: stopTimer()
             ViewModel->>ViewModel: setState(.diamondDrop)
             ViewModel->>Haptic: provideFeedback(success)
-            Note over ViewModel: ドロップ演出 (1.5秒)
+            Note over ViewModel: ドロップ演出 (DIAMOND_DROP_DURATION)
+            ViewModel->>ViewModel: Task.sleep(DIAMOND_DROP_DURATION)
             ViewModel->>ViewModel: setState(.result)
         else ドロップなし
             ViewModel->>OreBlock: reset()
+            ViewModel->>MiningSession: incrementOreCount()
             ViewModel->>ViewModel: setState(.playing)
         end
     end
 ```
 
+### アニメーション同期方式（重要）
+
+**採用方式**: Task.sleep() を事実上の同期タイミングとして使用
+
+**設計判断の根拠**:
+- SwiftUIはアニメーション完了イベントを標準で提供しない
+- `AnimationCompletionObserver`パターンは複雑性が増し、メンテナンスコストが高い
+- 本アプリのアニメーションは単純な0.4秒/1.5秒の固定時間であり、複雑な物理演算は不要
+- Task.sleep()とwithAnimationの時間を定数化することで、ズレを最小化
+
+**同期の保証方法**:
+```swift
+// アニメーション時間定数（一か所で管理）
+enum AnimationConstants {
+    static let destroyDuration: TimeInterval = 0.4
+    static let diamondDropDuration: TimeInterval = 1.5
+    static let crackTransitionDuration: TimeInterval = 0.15
+    static let startHintFadeDuration: TimeInterval = 1.0
+}
+
+// 破壊処理の実装パターン
+func processDestruction() async {
+    // 1. 状態を.destroyingに変更（UI側でアニメーション開始）
+    state = .destroying
+    isDestroyAnimationActive = true
+
+    // 2. アニメーションと同じ時間だけ待機
+    //    ※withAnimationのdurationと完全に一致させる
+    try? await Task.sleep(for: .seconds(AnimationConstants.destroyDuration))
+
+    // 3. アニメーション完了とみなして次処理
+    isDestroyAnimationActive = false
+    await performDropCheck()
+}
+```
+
+**SwiftUI View側の実装**:
+```swift
+OreBlockView()
+    .scaleEffect(viewModel.isDestroyAnimationActive ? 0.0 : 1.0)
+    .opacity(viewModel.isDestroyAnimationActive ? 0.0 : 1.0)
+    .animation(
+        .easeOut(duration: AnimationConstants.destroyDuration),
+        value: viewModel.isDestroyAnimationActive
+    )
+```
+
+**注意事項**:
+- Task.sleep()とwithAnimationのdurationは**必ず同じ定数を参照**すること
+- システム負荷でアニメーションが遅延しても、状態遷移はTask.sleep()基準で行う
+- アニメーションの視覚的完了とロジック的完了が±数msずれる可能性は許容する
+
 ### バックグラウンド/フォアグラウンド処理
+
+##### バックグラウンド中のアニメーション挙動（確定仕様）
+
+**設計方針**: バックグラウンド移行時に破壊アニメーション中であれば、即座に破壊完了扱いにする
+
+**設計判断の根拠**:
+- SwiftUIアニメーションはバックグラウンドで停止し、フォアグラウンド復帰時に不確定な状態になる
+- Task.sleep()もバックグラウンドでは中断される可能性がある
+- パーティクル（TimelineView）もバックグラウンドでは更新されない
+- 「中途半端な状態」を避けるため、シンプルに「即座に完了扱い」とする
+
+**具体的な挙動**:
+
+| バックグラウンド移行時の状態 | 処理内容 |
+|--------------------------|---------|
+| .idle | 何もしない |
+| .playing | タイマーを一時停止、フォアグラウンド復帰時に再開 |
+| .destroying | **即座に破壊完了扱い**。ドロップ判定を実行し、.playing or .diamondDrop に遷移 |
+| .diamondDrop | **即座にドロップ演出完了扱い**。.result に遷移 |
+| .result | 何もしない |
 
 ```mermaid
 sequenceDiagram
     participant ScenePhase
     participant ViewModel as GameViewModel
     participant Timer as TimerManager
-    participant Animation
 
     ScenePhase->>ViewModel: onChange(.background)
-    alt state == .playing or .destroying
+
+    alt state == .playing
         ViewModel->>Timer: pauseTimer()
-        ViewModel->>Animation: pauseAnimations()
-        Note over ViewModel: ゲーム状態を保持
+        Note over ViewModel: 状態保持、復帰待ち
+    else state == .destroying
+        Note over ViewModel: 破壊アニメーション中断
+        ViewModel->>ViewModel: isDestroyAnimationActive = false
+        ViewModel->>ViewModel: performDropCheck() (即座実行)
+        Note over ViewModel: .playing or .diamondDrop に遷移
+    else state == .diamondDrop
+        Note over ViewModel: ドロップ演出中断
+        ViewModel->>Timer: stopTimer()
+        ViewModel->>ViewModel: state = .result
     end
 
     ScenePhase->>ViewModel: onChange(.active)
+
     alt state == .playing
         ViewModel->>Timer: resumeTimer()
-        ViewModel->>Animation: resumeAnimations()
     end
+    Note over ViewModel: その他の状態は何もしない
 ```
+
+**実装パターン**:
+```swift
+@Observable
+class GameViewModel {
+    private var destroyTask: Task<Void, Never>?
+    private var diamondDropTask: Task<Void, Never>?
+
+    func handleScenePhaseChange(_ phase: ScenePhase) {
+        switch phase {
+        case .background:
+            handleBackgroundTransition()
+        case .active:
+            handleForegroundTransition()
+        default:
+            break
+        }
+    }
+
+    private func handleBackgroundTransition() {
+        switch state {
+        case .playing:
+            timerManager.pauseTimer()
+
+        case .destroying:
+            // 破壊アニメーションを即座に完了扱い
+            destroyTask?.cancel()
+            destroyTask = nil
+            isDestroyAnimationActive = false
+            performDropCheckSync()  // 同期的に実行
+
+        case .diamondDrop:
+            // ドロップ演出を即座に完了扱い
+            diamondDropTask?.cancel()
+            diamondDropTask = nil
+            state = .result
+
+        default:
+            break
+        }
+    }
+
+    private func handleForegroundTransition() {
+        if state == .playing {
+            timerManager.resumeTimer()
+        }
+        // その他の状態は何もしない（.resultなら結果表示のまま）
+    }
+
+    private func performDropCheckSync() {
+        let shouldDrop = randomProvider.random() < 0.10
+        if shouldDrop {
+            timerManager.stopTimer()
+            state = .result  // .diamondDropをスキップして直接.resultへ
+            hapticManager.provideFeedback(.success)
+        } else {
+            state = .playing
+        }
+    }
+}
+```
+
+**注意事項**:
+- バックグラウンド移行時に .destroying → .diamondDrop の場合、ドロップ演出はスキップして .result へ直接遷移
+- ユーザー体験として「バックグラウンドから戻ったら結果が出ていた」は許容する
+- フォアグラウンド復帰時に新たなアニメーションは開始しない（状態を引き継ぐ）
 
 ## Requirements Traceability
 
@@ -326,6 +487,40 @@ enum GameState: Equatable {
 | Intent | 鉱石のドメインロジックをカプセル化 |
 | Requirements | 1, 5, 8 |
 
+##### 破壊状態の扱い（確定仕様）
+
+**設計方針**: OreBlockは「タップ可能な状態」のみを表現し、破壊アニメーション表示はView層のローカル状態で管理
+
+**ロジックとUIの分離**:
+- OreBlock.tapCount == 3 になった瞬間、即座に OreBlock.reset() を呼び出す
+- 破壊アニメーションは GameViewModel.isDestroyAnimationActive フラグで制御
+- UI側は isDestroyAnimationActive == true の間、破壊エフェクトを表示
+- OreBlock自体は常に「次にタップ可能な状態」を保持
+
+**状態遷移のタイムライン**:
+```
+T+0.00s: タップ3回目
+         → OreBlock.increment() → tapCount == 3
+         → OreBlock.reset() → tapCount = 0 (即座にリセット)
+         → MiningSession.incrementOreCount()
+         → GameViewModel.isDestroyAnimationActive = true
+         → state = .destroying
+
+T+0.40s: Task.sleep(0.4)完了
+         → isDestroyAnimationActive = false
+         → dropCheck()実行
+         → state = .playing or .diamondDrop
+
+UI表示:
+  T+0.00s〜T+0.40s: 破壊アニメーション表示（scaleEffect, opacity変化）
+  T+0.40s〜: 新しい鉱石表示（isDestroyAnimationActiveがfalseになった瞬間）
+```
+
+**設計判断の根拠**:
+- OreBlockはドメインロジックに集中（tapCount管理のみ）
+- 破壊アニメーションはUIの関心事なのでView層で管理
+- isDestroyAnimationActiveフラグによりUI状態とロジック状態を独立
+
 ```swift
 struct OreBlock {
     private(set) var tapCount: Int = 0
@@ -335,12 +530,14 @@ struct OreBlock {
         case 0: return .none
         case 1: return .small
         case 2: return .large
-        default: return .broken
+        default: return .broken  // tapCount >= 3 は通常到達しない（即座にreset）
         }
     }
 
-    mutating func increment() {
+    /// タップ時に呼び出す。戻り値で破壊判定を行う
+    mutating func increment() -> Bool {
         tapCount += 1
+        return tapCount >= 3
     }
 
     mutating func reset() {
@@ -348,11 +545,41 @@ struct OreBlock {
     }
 }
 
-enum CrackLevel {
-    case none   // ヒビなし
-    case small  // 小ヒビ (1-2本)
-    case large  // 大ヒビ (3本以上)
-    case broken // 破壊
+enum CrackLevel: Equatable {
+    case none   // ヒビなし (tapCount == 0)
+    case small  // 小ヒビ (tapCount == 1)
+    case large  // 大ヒビ (tapCount == 2)
+    case broken // 破壊 (tapCount >= 3、通常は到達しない)
+}
+```
+
+**GameViewModelでの使用パターン**:
+```swift
+@Observable
+class GameViewModel {
+    var currentOreBlock: OreBlock = OreBlock()
+    var isDestroyAnimationActive: Bool = false  // UI用フラグ
+
+    func onOreTapped() {
+        // ...
+        let shouldDestroy = currentOreBlock.increment()
+
+        if shouldDestroy {
+            // 即座にリセット（次の鉱石として準備）
+            currentOreBlock.reset()
+            miningSession.incrementOreCount()
+
+            // アニメーションフラグを立てる
+            isDestroyAnimationActive = true
+            state = .destroying
+
+            Task {
+                try? await Task.sleep(for: .seconds(AnimationConstants.destroyDuration))
+                isDestroyAnimationActive = false
+                await performDropCheck()
+            }
+        }
+    }
 }
 ```
 
@@ -394,32 +621,98 @@ struct MiningSession {
 
 **Contracts**: [x] Service
 
+##### 精度方式（統一仕様）
+
+**採用方式**: 内部は常にDate基準で高精度計測、Combine.TimerはUI更新トリガーのみ
+
+**設計判断**:
+- 内部時間は`Date().timeIntervalSince(startDate)`で常に高精度（±0.001秒）
+- Combine.Timerは1秒ごとにUI更新をトリガーするだけ（時間計算には使用しない）
+- これにより「UIは1秒刻み表示、内部は高精度」の両立を実現
+- pauseTimer()時点の正確な経過時間を保持し、resumeTimer()で加算
+
 ##### Service Interface
 ```swift
 @Observable
 class TimerManager {
-    private(set) var elapsedTime: TimeInterval = 0.0
-    private var timerSubscription: AnyCancellable?
-    private var startDate: Date?
-    private var pausedElapsedTime: TimeInterval = 0.0
+    // 外部公開プロパティ
+    private(set) var elapsedTime: TimeInterval = 0.0  // 高精度計測値
 
-    func startTimer()
-    func stopTimer()
-    func pauseTimer()
-    func resumeTimer()
-    func reset()
+    // 内部状態
+    private var timerSubscription: AnyCancellable?
+    private var startDate: Date?                       // 計測開始時刻
+    private var accumulatedTime: TimeInterval = 0.0    // pause前の累積時間
+    private var isRunning: Bool = false
+
+    func startTimer() {
+        guard !isRunning else { return }
+        startDate = Date()
+        isRunning = true
+        // Combine.Timerは1秒ごとにUI更新をトリガー
+        timerSubscription = Timer.publish(every: 1.0, on: .main, in: .common)
+            .autoconnect()
+            .sink { [weak self] _ in
+                self?.updateElapsedTime()
+            }
+    }
+
+    private func updateElapsedTime() {
+        guard let start = startDate else { return }
+        // 常にDate基準で計算（高精度）
+        elapsedTime = accumulatedTime + Date().timeIntervalSince(start)
+    }
+
+    func pauseTimer() {
+        guard isRunning else { return }
+        // pause時点の正確な時間を保存
+        if let start = startDate {
+            accumulatedTime += Date().timeIntervalSince(start)
+        }
+        timerSubscription?.cancel()
+        timerSubscription = nil
+        startDate = nil
+        isRunning = false
+        elapsedTime = accumulatedTime
+    }
+
+    func resumeTimer() {
+        guard !isRunning else { return }
+        startTimer()  // accumulatedTimeは保持されたまま
+    }
+
+    func stopTimer() {
+        updateElapsedTime()  // 最終時間を確定
+        timerSubscription?.cancel()
+        timerSubscription = nil
+        isRunning = false
+    }
+
+    func reset() {
+        timerSubscription?.cancel()
+        timerSubscription = nil
+        startDate = nil
+        accumulatedTime = 0.0
+        elapsedTime = 0.0
+        isRunning = false
+    }
 
     var formattedTime: String {
-        let minutes = Int(elapsedTime) / 60
-        let seconds = Int(elapsedTime) % 60
+        let totalSeconds = Int(elapsedTime)
+        let minutes = totalSeconds / 60
+        let seconds = totalSeconds % 60
         return String(format: "%02d:%02d", minutes, seconds)
     }
 }
 ```
 
+**精度保証**:
+- 内部elapsedTimeは±0.001秒の精度（Date基準）
+- UI表示は1秒刻み（MM:SS形式）
+- pause/resume時の累積誤差なし（accumulatedTimeで正確に保持）
+
 **Implementation Notes**
-- **Integration**: Combine.Timerで1秒ごとにDate().timeIntervalSince(startDate)を計算
-- **Validation**: pauseTimer()時に現在のelapsedTimeを保存、resumeTimer()時に加算
+- **Integration**: Combine.Timerは1秒ごとにupdateElapsedTime()を呼び出すトリガー
+- **Validation**: pause時にaccumulatedTimeを保存、resume時は新しいstartDateから再計測
 - **Risks**: バックグラウンド中のTimer停止 → ScenePhaseでpause/resume処理
 
 #### HapticFeedbackManager
@@ -431,16 +724,59 @@ class TimerManager {
 
 **Contracts**: [x] Service
 
+##### ライフサイクル仕様（確定）
+
+**prepare()のタイミング**: GameState.idle → .playing 遷移時（初回タップ時）に一度だけ呼び出す
+
+**cleanup()のタイミング**: GameState → .result 遷移時に呼び出す
+
+**設計判断の根拠**:
+- prepare()は呼び出しから数秒間のみ有効（Apple公式ドキュメント）
+- ゲームセッション開始時にprepare()を呼び、セッション中（数秒〜数分）は有効状態を維持
+- 各タップ直前にprepare()を呼んでも、レイテンシ改善効果はほぼない
+- プレイ中は継続的にタップするため、prepare()の効果は持続する想定
+
 ##### Service Interface
 ```swift
 class HapticFeedbackManager {
     private var lightGenerator: UIImpactFeedbackGenerator?
     private var mediumGenerator: UIImpactFeedbackGenerator?
     private var notificationGenerator: UINotificationFeedbackGenerator?
+    private var isPrepared: Bool = false
 
-    func prepare()
-    func provideFeedback(_ type: HapticFeedbackType)
-    func cleanup()
+    /// GameState.idle → .playing 遷移時に呼び出す（一度だけ）
+    func prepare() {
+        guard !isPrepared else { return }
+        lightGenerator = UIImpactFeedbackGenerator(style: .light)
+        mediumGenerator = UIImpactFeedbackGenerator(style: .medium)
+        notificationGenerator = UINotificationFeedbackGenerator()
+
+        lightGenerator?.prepare()
+        mediumGenerator?.prepare()
+        notificationGenerator?.prepare()
+        isPrepared = true
+    }
+
+    /// タップ時に呼び出す（prepare()済みであれば低レイテンシ）
+    func provideFeedback(_ type: HapticFeedbackType) {
+        switch type {
+        case .light:
+            lightGenerator?.impactOccurred()
+            lightGenerator?.prepare()  // 次のタップ用に再準備
+        case .medium:
+            mediumGenerator?.impactOccurred()
+        case .success:
+            notificationGenerator?.notificationOccurred(.success)
+        }
+    }
+
+    /// GameState → .result 遷移時に呼び出す
+    func cleanup() {
+        lightGenerator = nil
+        mediumGenerator = nil
+        notificationGenerator = nil
+        isPrepared = false
+    }
 }
 
 enum HapticFeedbackType {
@@ -450,10 +786,31 @@ enum HapticFeedbackType {
 }
 ```
 
+**GameViewModelでの呼び出しパターン**:
+```swift
+func onOreTapped() {
+    // 初回タップ時のみ
+    if state == .idle {
+        state = .playing
+        timerManager.startTimer()
+        hapticManager.prepare()  // ← ここで一度だけ
+    }
+
+    // ... タップ処理
+
+    hapticManager.provideFeedback(.light)  // ← 毎回のタップ
+}
+
+func transitionToResult() {
+    state = .result
+    hapticManager.cleanup()  // ← ここで解放
+}
+```
+
 **Implementation Notes**
-- **Integration**: prepare()はGameState.playing遷移時、cleanup()はstate.result遷移時に呼び出し
-- **Validation**: UIDevice.current.userInterfaceIdiom == .phoneでデバイス判定
-- **Risks**: Simulator非対応 → 実機テスト必須
+- **Integration**: prepare()はGameState.idle→.playing遷移時のみ（初回タップ）
+- **Validation**: UIDevice.current.userInterfaceIdiom == .phoneでデバイス判定（Simulatorでは無視）
+- **Risks**: Simulator非対応 → 実機テスト必須、長時間プレイでprepare()効果切れの可能性あり（許容）
 
 #### RandomProvider
 
@@ -518,10 +875,130 @@ struct MockRandomProvider: RandomProvider {
 | Intent | Canvas APIを使用した破壊パーティクルの描画 |
 | Requirements | 8, 11 |
 
+##### パーティクル生成パラメータ（確定仕様）
+
+**パーティクル定数**:
+```swift
+enum ParticleConstants {
+    // 個数
+    static let minCount: Int = 4
+    static let maxCount: Int = 8
+
+    // サイズ（pt）
+    static let minSize: CGFloat = 8.0
+    static let maxSize: CGFloat = 16.0
+
+    // 速度（pt/秒）
+    static let minVelocity: CGFloat = 100.0
+    static let maxVelocity: CGFloat = 200.0
+
+    // 飛散範囲
+    static let maxDistanceRatio: CGFloat = 0.30  // 画面幅の30%
+
+    // 時間
+    static let duration: TimeInterval = 0.4  // AnimationConstants.destroyDurationと同値
+}
+```
+
+**パーティクル生成アルゴリズム**:
+```swift
+struct Particle: Identifiable {
+    let id = UUID()
+    let startPosition: CGPoint    // 鉱石中心座標
+    let size: CGFloat             // 8-16pt
+    let angle: Double             // 放射角度（ラジアン）
+    let velocity: CGFloat         // 速度（pt/秒）
+    let color: Color              // グレー系（鉱石の破片色）
+
+    func position(at progress: Double) -> CGPoint {
+        let distance = velocity * CGFloat(progress) * ParticleConstants.duration
+        return CGPoint(
+            x: startPosition.x + cos(angle) * distance,
+            y: startPosition.y + sin(angle) * distance
+        )
+    }
+}
+
+func generateParticles(center: CGPoint, screenWidth: CGFloat) -> [Particle] {
+    let count = Int.random(in: ParticleConstants.minCount...ParticleConstants.maxCount)
+    let maxDistance = screenWidth * ParticleConstants.maxDistanceRatio
+
+    return (0..<count).map { index in
+        // 放射状に均等配置 + ランダムなズレ（±15度）
+        let baseAngle = (Double(index) / Double(count)) * 2.0 * .pi
+        let angleOffset = Double.random(in: -.pi/12 ... .pi/12)
+        let angle = baseAngle + angleOffset
+
+        // 速度はmaxDistanceに到達するよう調整
+        let velocity = CGFloat.random(
+            in: ParticleConstants.minVelocity...ParticleConstants.maxVelocity
+        )
+
+        return Particle(
+            startPosition: center,
+            size: CGFloat.random(in: ParticleConstants.minSize...ParticleConstants.maxSize),
+            angle: angle,
+            velocity: velocity,
+            color: [Color.gray, Color(white: 0.5), Color(white: 0.3)].randomElement()!
+        )
+    }
+}
+```
+
+**Canvas描画**:
+```swift
+struct ParticleEffectView: View {
+    let particles: [Particle]
+    let isActive: Bool
+
+    @State private var progress: Double = 0.0
+
+    var body: some View {
+        TimelineView(.animation(minimumInterval: 1.0/60.0)) { context in
+            Canvas { canvasContext, size in
+                for particle in particles {
+                    let position = particle.position(at: progress)
+                    let opacity = 1.0 - progress  // フェードアウト
+                    let scale = 1.0 - (progress * 0.5)  // 徐々に小さく
+
+                    let rect = CGRect(
+                        x: position.x - particle.size * scale / 2,
+                        y: position.y - particle.size * scale / 2,
+                        width: particle.size * scale,
+                        height: particle.size * scale
+                    )
+
+                    canvasContext.opacity = opacity
+                    canvasContext.fill(
+                        Path(rect),
+                        with: .color(particle.color)
+                    )
+                }
+            }
+        }
+        .onChange(of: isActive) { _, newValue in
+            if newValue {
+                progress = 0.0
+                withAnimation(.linear(duration: ParticleConstants.duration)) {
+                    progress = 1.0
+                }
+            }
+        }
+    }
+}
+```
+
+**乱数生成**:
+- パーティクルの生成には `SystemRandomProvider` ではなく、Swift標準の `Int.random()`, `CGFloat.random()`, `Double.random()` を使用
+- ゲームロジック（ドロップ判定）とは独立した乱数系列のため、テスタビリティへの影響なし
+- 全デバイスで異なる見た目になるが、演出目的のため許容
+
 **Implementation Notes**
 - TimelineView + Canvasで60FPS維持
 - 4-8個のRectangle破片を放射状に飛散（画面幅30%以内）
 - アニメーション時間: 0.4秒（破壊アニメーションと同期）
+- 色はグレー系3色からランダム選択（鉱石の破片イメージ）
+- フェードアウト + スケールダウンで自然な消滅
 
 ## Data Models
 
