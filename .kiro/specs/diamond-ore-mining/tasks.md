@@ -16,7 +16,7 @@
   - CrackLevel enumをnone、small、large、brokenの4レベルで実装
   - _Requirements: 1, 4, 5, 7_
 
-- [ ] 1.2 (P) タイマー管理機能を実装
+- [x] 1.2 (P) タイマー管理機能を実装
   - Date基準の高精度時間計測を実装（±0.001秒）
   - Combine.Timerを1秒ごとのUI更新トリガーとして使用
   - pauseTimer()でaccumulatedTimeに経過時間を保存
@@ -24,7 +24,7 @@
   - formattedTime計算プロパティで「MM:SS」形式を提供
   - _Requirements: 3, 14_
 
-- [ ] 1.3 (P) ハプティックフィードバック管理を実装
+- [x] 1.3 (P) ハプティックフィードバック管理を実装
   - lightGenerator（UIImpactFeedbackGenerator.light）を初期化
   - mediumGenerator（UIImpactFeedbackGenerator.medium）を初期化
   - notificationGenerator（UINotificationFeedbackGenerator）を初期化
@@ -33,13 +33,13 @@
   - cleanup()でresult遷移時にgeneratorを解放
   - _Requirements: 9_
 
-- [ ] 1.4 (P) 乱数生成プロバイダーを実装
+- [x] 1.4 (P) 乱数生成プロバイダーを実装
   - RandomProviderプロトコルを定義（random() -> Double）
   - SystemRandomProviderを実装（Double.random(in: 0.0...1.0)）
   - MockRandomProviderを実装（テスト用固定値）
   - _Requirements: 2_
 
-- [ ] 1.5 (P) アニメーション定数を定義
+- [x] 1.5 (P) アニメーション定数を定義
   - AnimationConstants enumを実装
   - destroyDuration（0.4秒）を定義
   - diamondDropDuration（1.5秒）を定義
