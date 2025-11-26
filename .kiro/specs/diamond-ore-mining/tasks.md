@@ -9,7 +9,7 @@
 ### Phase 1: Foundation & Core Models
 
 - [ ] 1. ドメインモデルとユーティリティの実装
-- [ ] 1.1 (P) ゲーム状態とドメインモデルを定義
+- [x] 1.1 (P) ゲーム状態とドメインモデルを定義
   - GameState enumを5状態（idle, playing, destroying, diamondDrop, result）で実装
   - OreBlock structを実装し、tapCount、crackLevel、increment()、reset()を提供
   - MiningSession structを実装し、oreCount、elapsedTime、incrementOreCount()、updateElapsedTime()、reset()を提供
